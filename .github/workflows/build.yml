@@ -1,0 +1,155 @@
+name: Build OntCoin release APK + AAB (Play Store)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # Always-rising version code for every build (Play rejects repeats). Raise the prefix if Play says it is too low.
+      VERSION_CODE: ${{ github.run_number }}00
+      EXPECTED_PACKAGE: com.ontcoin.network.linexware
+    steps:
+      - uses: actions/checkout@v4
+
+      # Works in both layouts: the project extracted in the repo root, OR a single project .zip committed to the repo.
+      - name: Locate the project
+        run: |
+          if ! find . -name settings.gradle.kts -not -path "./_project/*" | grep -q .; then
+            ZIP=$(ls ./*.zip 2>/dev/null | head -1 || true)
+            [ -n "$ZIP" ] && unzip -q "$ZIP" -d _project
+          fi
+          SETTINGS=$(find . -name settings.gradle.kts | head -1)
+          [ -n "$SETTINGS" ] || { echo "::error::settings.gradle.kts not found"; exit 1; }
+          echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Android SDK 36
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0" >/dev/null 2>&1 || true
+
+      # The Android plugin used by this project (9.1.x) needs Gradle 9.3.1.
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.3.1
+
+      # Optional: use the key from GitHub secrets instead of the file in the project.
+      - name: Signing key
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then echo "$KEYSTORE_BASE64" | base64 -d > app/build.jks; echo "Using the keystore from the KEYSTORE_BASE64 secret"; else echo "Using app/build.jks from the project"; fi
+          test -s app/build.jks || { echo "::error::app/build.jks is missing"; exit 1; }
+
+      # The web app rejects the Android app if this secret differs from OT_APP_SECRET in the web config.
+      - name: Check the web/app secret is set
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          APP_SECRET: ${{ secrets.APP_SECRET }}
+        run: |
+          if [ -z "$APP_SECRET" ] && ! grep -Eq '^APP_SECRET=.{16,}' gradle.properties; then
+            echo "::error::APP_SECRET is not set (add it to gradle.properties or as a GitHub secret). The app would be rejected by the server."; exit 1
+          fi
+
+      - name: Build signed APK and AAB
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        env:
+          # Blank or missing values are ignored; gradle.properties is used instead.
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          APP_SECRET: ${{ secrets.APP_SECRET }}
+        run: |
+          set -o pipefail
+          gradle assembleRelease bundleRelease --no-daemon 2>&1 | tee build.log
+
+      # If the build fails, list the exact Kotlin/Gradle errors in the run summary and keep the full log.
+      - name: Show compile errors
+        if: failure()
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          {
+            echo "## Build errors"
+            echo '```'
+            grep -E "^e: |error:|FAILURE|What went wrong" -A2 build.log | grep -E "^e: |error:|What went wrong|> " | head -80 || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OntCoin-build-log
+          path: ${{ env.PROJECT_DIR }}/build.log
+
+      - name: Verify both files are signed with the permanent key
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          WANT=$(tr -d ':\n ' < EXPECTED_SHA256.txt | tr 'a-f' 'A-F')
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          AAB=$(ls app/build/outputs/bundle/release/*.aab | head -1)
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | tail -1)
+          "$APKSIGNER" verify --print-certs "$APK" > apk-certs.txt
+          GOT_APK=$(grep "SHA-256 digest" apk-certs.txt | head -1 | sed 's/.*: *//' | tr -d ':' | tr 'a-f' 'A-F')
+          GOT_AAB=$(keytool -printcert -jarfile "$AAB" | grep "SHA256:" | head -1 | sed 's/.*SHA256: *//' | tr -d ':' | tr 'a-f' 'A-F')
+          echo "Expected $WANT"; echo "APK      $GOT_APK"; echo "AAB      $GOT_AAB"
+          [ "$GOT_APK" = "$WANT" ] || { echo "::error::APK is NOT signed with the permanent key"; exit 1; }
+          [ "$GOT_AAB" = "$WANT" ] || { echo "::error::AAB is NOT signed with the permanent key"; exit 1; }
+          echo "versionCode used: $VERSION_CODE"
+
+      - name: Verify Play Store requirements (APK + AAB)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          AAB=$(ls app/build/outputs/bundle/release/*.aab | head -1)
+          AAPT2=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | tail -1)
+          "$AAPT2" dump badging "$APK" > badging.txt
+          grep -E "^package:|dkVersion|application-debuggable" badging.txt || true
+          grep -q "name='$EXPECTED_PACKAGE'" badging.txt || { echo "::error::Wrong package name (expected $EXPECTED_PACKAGE; it must match google-services.json and the Play listing)"; exit 1; }
+          grep -qE "^(sdkVersion|minSdkVersion):'24'" badging.txt || { echo "::error::APK minSdk is not 24 (Android 7)"; exit 1; }
+          TARGET=$(grep "^targetSdkVersion" badging.txt | sed "s/[^0-9]//g")
+          [ "$TARGET" -ge 36 ] || { echo "::error::APK targetSdk is $TARGET, Play needs 36+"; exit 1; }
+          ! grep -q "application-debuggable" badging.txt || { echo "::error::APK is debuggable - Play rejects this"; exit 1; }
+          curl -fsSL -o bundletool.jar https://github.com/google/bundletool/releases/download/1.18.1/bundletool-all-1.18.1.jar
+          java -jar bundletool.jar validate --bundle="$AAB"
+          MINSDK=$(java -jar bundletool.jar dump manifest --bundle="$AAB" --xpath=/manifest/uses-sdk/@android:minSdkVersion)
+          TGTSDK=$(java -jar bundletool.jar dump manifest --bundle="$AAB" --xpath=/manifest/uses-sdk/@android:targetSdkVersion)
+          echo "AAB minSdk=$MINSDK targetSdk=$TGTSDK"
+          [ "$MINSDK" = "24" ] || { echo "::error::AAB minSdk is $MINSDK, expected 24"; exit 1; }
+          [ "$TGTSDK" -ge 36 ] || { echo "::error::AAB targetSdk is $TGTSDK, Play needs 36+"; exit 1; }
+          DEBUGGABLE=$(java -jar bundletool.jar dump manifest --bundle="$AAB" --xpath=/manifest/application/@android:debuggable 2>/dev/null || true)
+          [ "$DEBUGGABLE" != "true" ] || { echo "::error::AAB is debuggable - Play rejects this"; exit 1; }
+          jarsigner -verify "$AAB" | head -3
+          echo "All Play Store checks passed."
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: OntCoin-APK
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/release/*.apk
+
+      - name: Upload AAB (for Google Play)
+        uses: actions/upload-artifact@v4
+        with:
+          name: OntCoin-AAB-for-PlayStore
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/bundle/release/*.aab
+
+      - name: Upload R8 mapping (deobfuscation)
+        uses: actions/upload-artifact@v4
+        with:
+          name: OntCoin-mapping
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/mapping/release/mapping.txt
