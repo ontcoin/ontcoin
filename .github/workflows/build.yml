@@ -12,11 +12,16 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      # Always-rising version code for every build (Play rejects repeats). Raise the prefix if Play says it is too low.
-      VERSION_CODE: ${{ github.run_number }}00
       EXPECTED_PACKAGE: com.ontcoin.network.linexware
     steps:
       - uses: actions/checkout@v4
+
+      # Always-rising version code (Android blocks installs of a LOWER versionCode over a higher one; Play rejects repeats).
+      # 10000 + run number is above the old 1200 build, so it installs as an update over it, and it keeps rising every run.
+      - name: Set version code
+        run: |
+          echo "VERSION_CODE=$((10000 + GITHUB_RUN_NUMBER))" >> "$GITHUB_ENV"
+          echo "versionCode will be $((10000 + GITHUB_RUN_NUMBER))"
 
       # Works in both layouts: the project extracted in the repo root, OR a single project .zip committed to the repo.
       - name: Locate the project
@@ -107,6 +112,7 @@ jobs:
           GOT_APK=$(grep "SHA-256 digest" apk-certs.txt | head -1 | sed 's/.*: *//' | tr -d ':' | tr 'a-f' 'A-F')
           GOT_AAB=$(keytool -printcert -jarfile "$AAB" | grep "SHA256:" | head -1 | sed 's/.*SHA256: *//' | tr -d ':' | tr 'a-f' 'A-F')
           echo "Expected $WANT"; echo "APK      $GOT_APK"; echo "AAB      $GOT_AAB"
+          "$APKSIGNER" verify --min-sdk-version 24 --max-sdk-version 36 "$APK" || { echo "::error::APK signature is not valid for Android 7 (API 24) to Android 16 (API 36)"; exit 1; }
           [ "$GOT_APK" = "$WANT" ] || { echo "::error::APK is NOT signed with the permanent key"; exit 1; }
           [ "$GOT_AAB" = "$WANT" ] || { echo "::error::AAB is NOT signed with the permanent key"; exit 1; }
           echo "versionCode used: $VERSION_CODE"
